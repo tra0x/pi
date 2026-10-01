@@ -234,6 +234,16 @@ export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	 * For example, Anthropic uses `user_id` for abuse tracking and rate limiting.
 	 */
 	metadata?: Record<string, unknown>;
+	/**
+	 * Declares that the caller retains the final `AssistantMessage` from `done` and replays it
+	 * with all of its metadata, instead of a message rebuilt from stream events. Enables
+	 * responses whose replay depends on that metadata, such as Anthropic fallback after output
+	 * began (`anthropicFallbacks`). Without it, the Anthropic adapter fails such turns.
+	 * Never forward this from a remote client: a server that sets it but sends clients only
+	 * reduced events leaves their rebuilt history without that metadata, and the provider can
+	 * then reject later requests. Default: false.
+	 */
+	retainsFinalMessage?: boolean;
 }
 
 export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
@@ -543,9 +553,36 @@ export interface UserMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
+/** Anthropic server-side fallback marker, stored exactly as received and echoed back on replay. */
+export interface AnthropicFallbackBlock {
+	type: "fallback";
+	/** Model whose output ends at this marker. */
+	from: { model: string };
+	/** Model that produced the content after this marker. */
+	to: { model: string };
+	trigger?: JsonValue;
+}
+
+/** Position of an Anthropic fallback marker between assistant content blocks. */
+export interface AnthropicFallbackBoundary {
+	/** The marker precedes `content[position]`; `content.length` places it after all content. */
+	position: number;
+	block: AnthropicFallbackBlock;
+}
+
 export interface AssistantMessage {
 	role: "assistant";
 	content: (TextContent | ThinkingContent | ToolCall)[];
+	/**
+	 * Anthropic fallback markers in stream order. Content before the last marker came from
+	 * models that declined; its thinking is dropped on replay. The last marker's `to.model`
+	 * served the response. Positions refer to this message's `content` array; code that edits
+	 * that content must remap them. A marker after content began is recorded only when the
+	 * request set `retainsFinalMessage`; otherwise the Anthropic adapter fails the turn. It
+	 * always fails the turn instead of recording a marker after a tool call, so no tool call
+	 * precedes the last marker. Reduced proxy streams do not carry this field.
+	 */
+	anthropicFallbacks?: AnthropicFallbackBoundary[];
 	api: Api;
 	provider: ProviderId;
 	model: string;

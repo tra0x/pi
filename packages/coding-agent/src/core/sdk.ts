@@ -327,6 +327,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			websocketConnectTimeoutMs: options.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
 			maxRetries: options.maxRetries ?? providerRetrySettings.maxRetries,
 			maxRetryDelayMs: options.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+			// AgentSession persists and replays the complete message_end message (#9074).
+			retainsFinalMessage: true,
 			transformHeaders: async (requestHeaders) => {
 				const headers = mergeProviderAttributionHeaders(
 					requestModel,

@@ -96,19 +96,24 @@ export function transformMessages<TApi extends Api>(
 				assistantMsg.provider === model.provider &&
 				assistantMsg.api === model.api &&
 				assistantMsg.model === model.id;
+			// Thinking before the last Anthropic fallback marker came from models that declined.
+			// Anthropic rejects it on replay, and it must not become visible text for other models.
+			const fallbacks = assistantMsg.anthropicFallbacks;
+			const abandonedThinkingEnd = fallbacks?.at(-1)?.position ?? 0;
 
-			const transformedContent = assistantMsg.content.flatMap((block) => {
+			const transformedBlocks = assistantMsg.content.map((block, index) => {
 				if (block.type === "thinking") {
+					if (index < abandonedThinkingEnd) return undefined;
 					// Redacted thinking is opaque encrypted content, only valid for the same model.
 					// Drop it for cross-model to avoid API errors.
 					if (block.redacted) {
-						return isSameModel ? block : [];
+						return isSameModel ? block : undefined;
 					}
 					// For same model: keep thinking blocks with signatures (needed for replay)
 					// even if the thinking text is empty (OpenAI encrypted reasoning)
 					if (isSameModel && block.thinkingSignature) return block;
 					// Skip empty thinking blocks, convert others to plain text
-					if (!block.thinking || block.thinking.trim() === "") return [];
+					if (!block.thinking || block.thinking.trim() === "") return undefined;
 					if (isSameModel) return block;
 					return {
 						type: "text" as const,
@@ -147,10 +152,21 @@ export function transformMessages<TApi extends Api>(
 				return block;
 			});
 
-			return {
+			const transformedMsg: AssistantMessage = {
 				...assistantMsg,
-				content: transformedContent,
+				content: transformedBlocks.filter((block) => block !== undefined),
 			};
+			// Markers are only meaningful to the Anthropic API and provider that produced them.
+			// Rebase their positions onto the blocks that remain.
+			if (fallbacks && assistantMsg.api === model.api && assistantMsg.provider === model.provider) {
+				transformedMsg.anthropicFallbacks = fallbacks.map((fallback) => ({
+					...fallback,
+					position: transformedBlocks.slice(0, fallback.position).filter((block) => block !== undefined).length,
+				}));
+			} else {
+				delete transformedMsg.anthropicFallbacks;
+			}
+			return transformedMsg;
 		}
 		return msg;
 	});

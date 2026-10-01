@@ -1,8 +1,18 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { type PiMessagesOptions, stream, streamSimple } from "../src/api/pi-messages.ts";
-import type { Api, AssistantMessageEvent, Context, Model, StopReason } from "../src/types.ts";
+import { streamSimple as anthropicStreamSimple } from "../src/api/anthropic-messages.ts";
+import { type PiMessagesEvent, type PiMessagesOptions, stream, streamSimple } from "../src/api/pi-messages.ts";
+import { getModel } from "../src/compat.ts";
+import type {
+	Api,
+	AssistantMessageEvent,
+	Context,
+	Message,
+	Model,
+	StopReason,
+	TranscriptContext,
+} from "../src/types.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 type RecordedRequest = {
@@ -281,4 +291,183 @@ describe("pi-messages api registration", () => {
 		const api: Api = "pi-messages";
 		expect(api).toBe("pi-messages");
 	});
+});
+
+// Regression tests for https://github.com/earendil-works/pi/issues/9074. The backend below runs
+// pi-ai's Anthropic adapter and serializes PiMessagesEvent, which drops `partial` and terminal
+// message metadata such as `anthropicFallbacks`.
+describe("pi-messages with an Anthropic fallback after output", () => {
+	type BackendRequest = { model: string; context: TranscriptContext; options: Record<string, unknown> };
+	type AnthropicPayload = { messages: Array<{ role: string; content: unknown }> };
+
+	const anthropicModel = getModel("anthropic", "claude-opus-5");
+
+	function anthropicSse(events: Array<{ type: string } & Record<string, unknown>>): Response {
+		const body = events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+		return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+	}
+
+	function block(index: number, contentBlock: Record<string, unknown>, deltas: Record<string, unknown>[] = []) {
+		return [
+			{ type: "content_block_start", index, content_block: contentBlock },
+			...deltas.map((delta) => ({ type: "content_block_delta", index, delta })),
+			{ type: "content_block_stop", index },
+		];
+	}
+
+	const midOutputFallback = () =>
+		anthropicSse([
+			{
+				type: "message_start",
+				message: { id: "msg_a", model: "claude-opus-5", usage: { input_tokens: 10, output_tokens: 0 } },
+			},
+			...block(0, { type: "thinking", thinking: "", signature: "" }, [
+				{ type: "thinking_delta", thinking: "declined reasoning" },
+				{ type: "signature_delta", signature: "sig-a" },
+			]),
+			...block(1, { type: "text", text: "" }, [{ type: "text_delta", text: "partial" }]),
+			...block(2, { type: "fallback", from: { model: "claude-opus-5" }, to: { model: "claude-opus-4-8" } }),
+			...block(3, { type: "text", text: "" }, [{ type: "text_delta", text: "fallback answer" }]),
+			{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } },
+			{ type: "message_stop" },
+		]);
+
+	const plainAnswer = () =>
+		anthropicSse([
+			{
+				type: "message_start",
+				message: { id: "msg_b", model: "claude-opus-5", usage: { input_tokens: 10, output_tokens: 0 } },
+			},
+			...block(0, { type: "text", text: "" }, [{ type: "text_delta", text: "ok" }]),
+			{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+			{ type: "message_stop" },
+		]);
+
+	function toPiMessagesEvent(event: AssistantMessageEvent): PiMessagesEvent {
+		switch (event.type) {
+			case "start":
+				return { type: "start" };
+			case "text_start":
+			case "thinking_start":
+				return { type: event.type, contentIndex: event.contentIndex };
+			case "text_delta":
+			case "thinking_delta":
+			case "toolcall_delta":
+				return { type: event.type, contentIndex: event.contentIndex, delta: event.delta };
+			case "text_end": {
+				const content = event.partial.content[event.contentIndex];
+				const contentSignature = content?.type === "text" ? content.textSignature : undefined;
+				return { type: "text_end", contentIndex: event.contentIndex, content: event.content, contentSignature };
+			}
+			case "thinking_end": {
+				const content = event.partial.content[event.contentIndex];
+				const thinking = content?.type === "thinking" ? content : undefined;
+				return {
+					type: "thinking_end",
+					contentIndex: event.contentIndex,
+					content: event.content,
+					contentSignature: thinking?.thinkingSignature,
+					redacted: thinking?.redacted,
+				};
+			}
+			case "toolcall_start": {
+				const content = event.partial.content[event.contentIndex];
+				if (content?.type !== "toolCall") throw new Error("Expected a tool call");
+				return { type: "toolcall_start", contentIndex: event.contentIndex, id: content.id, toolName: content.name };
+			}
+			case "toolcall_end":
+				return { type: "toolcall_end", contentIndex: event.contentIndex, toolCall: event.toolCall };
+			case "done":
+				if (event.reason === "deferred") throw new Error("Deferred responses are not served");
+				return {
+					type: "done",
+					reason: event.reason,
+					usage: event.message.usage,
+					responseId: event.message.responseId,
+				};
+			case "error":
+				return {
+					type: "error",
+					reason: event.reason,
+					usage: event.error.usage,
+					errorMessage: event.error.errorMessage,
+					responseId: event.error.responseId,
+				};
+		}
+	}
+
+	/**
+	 * Runs two client turns through a backend. With `relabel`, the backend rewrites history to the
+	 * underlying Anthropic identity, so same-model signed thinking would be replayed.
+	 */
+	async function runConversation(relabel: boolean) {
+		const backendRequests: BackendRequest[] = [];
+		const anthropicPayloads: AnthropicPayload[] = [];
+		const anthropicResponses = [midOutputFallback(), plainAnswer()];
+		const upstream: typeof fetch = async (_input, init) => {
+			anthropicPayloads.push(JSON.parse(String(init?.body)) as AnthropicPayload);
+			const response = anthropicResponses.shift();
+			if (!response) throw new Error("Unexpected Anthropic request");
+			return response;
+		};
+		const backend: typeof fetch = async (_input, init) => {
+			const request = JSON.parse(String(init?.body)) as BackendRequest;
+			backendRequests.push(request);
+			const messages = relabel
+				? request.context.messages.map((message) =>
+						message.role === "assistant"
+							? {
+									...message,
+									api: anthropicModel.api,
+									provider: anthropicModel.provider,
+									model: anthropicModel.id,
+								}
+							: message,
+					)
+				: request.context.messages;
+			const events: PiMessagesEvent[] = [];
+			for await (const event of anthropicStreamSimple(
+				anthropicModel,
+				{ ...request.context, messages },
+				{ apiKey: "server-key", cacheRetention: "none", fetch: upstream },
+			)) {
+				events.push(toPiMessagesEvent(event));
+			}
+			return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		};
+		const model = createModel("https://backend.example.com/v1");
+		const userHello: Message = { role: "user", content: "Hello", timestamp: 1 };
+		const options = { apiKey: "test-key", fetch: backend, retainsFinalMessage: true };
+
+		const first = await stream(model, normalizeContext({ messages: [userHello] }), options).result();
+		const next: Message = { role: "user", content: "Next", timestamp: 3 };
+		await stream(model, normalizeContext({ messages: [userHello, first, next] }), options).result();
+		return { first, backendRequests, anthropicPayloads };
+	}
+
+	for (const relabel of [false, true]) {
+		it(`fails the turn and keeps the next request clean with ${relabel ? "relabelled" : "as-sent"} identity`, async () => {
+			const { first, backendRequests, anthropicPayloads } = await runConversation(relabel);
+
+			expect(first.stopReason).toBe("error");
+			expect(first.errorMessage).toBe("Anthropic performed an unsupported mid-output model fallback");
+			expect(first.model).toBe("auto");
+			for (const request of backendRequests) {
+				expect(request.options).not.toHaveProperty("retainsFinalMessage");
+			}
+			// The client sends its history raw, including the errored turn; the backend drops it.
+			expect(backendRequests[1].context.messages.map((message) => message.role)).toEqual([
+				"user",
+				"assistant",
+				"user",
+			]);
+			expect(anthropicPayloads).toHaveLength(2);
+			expect(anthropicPayloads[1].messages.map((message) => message.role)).not.toContain("assistant");
+			expect(JSON.stringify(anthropicPayloads[1])).not.toContain("sig-a");
+			expect(JSON.stringify(anthropicPayloads[1])).not.toContain("partial");
+		});
+	}
 });

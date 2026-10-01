@@ -12,6 +12,7 @@ import type {
 } from "@anthropic-ai/sdk/resources/beta/messages/messages.js";
 import { calculateCost } from "../models.ts";
 import type {
+	AnthropicFallbackBlock,
 	Api,
 	AssistantMessage,
 	CacheRetention,
@@ -202,10 +203,6 @@ const DEFERRED_TOOL_PLACEHOLDER: BetaTool = {
 	input_schema: { type: "object", properties: {}, required: [] },
 	defer_loading: true,
 };
-
-function shouldUseServerSideFallbackBeta(model: Model<"anthropic-messages">): boolean {
-	return (model.compat?.allowedFallbackModels?.length ?? 0) > 0;
-}
 
 function getAnthropicCompat(model: Model<"anthropic-messages">) {
 	const isOpenRouter = model.provider === "openrouter" || model.baseUrl.includes("openrouter.ai");
@@ -547,6 +544,19 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			let isOAuth: boolean;
 			let usageModel = model;
 			let inputTransformations: BetaThinkingDroppedInputTransformation[] | undefined;
+			// Keep `model` as the requested identity (#9188); report and price the serving model.
+			const setServingModel = (servingModel: string) => {
+				if (servingModel === model.id) {
+					delete output.responseModel;
+					usageModel = model;
+					return;
+				}
+				output.responseModel = servingModel;
+				const fallbackCost = model.compat?.allowedFallbackModels?.find(
+					(fallback) => fallback.provider === model.provider && fallback.model === servingModel,
+				)?.cost;
+				usageModel = fallbackCost ? { ...model, id: servingModel, cost: fallbackCost } : model;
+			};
 
 			if (options?.client) {
 				client = options.client;
@@ -608,15 +618,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					output.responseId = event.message.id;
 					const transformations = event.message.input_transformations;
 					if (Array.isArray(transformations)) inputTransformations = transformations;
-					const responseModel = event.message.model;
-					if (responseModel !== model.id) output.responseModel = responseModel;
-					const fallbackCost =
-						responseModel === model.id
-							? undefined
-							: model.compat?.allowedFallbackModels?.find(
-									(fallback) => fallback.provider === model.provider && fallback.model === responseModel,
-								)?.cost;
-					usageModel = fallbackCost ? { ...model, id: responseModel, cost: fallbackCost } : model;
+					setServingModel(event.message.model);
 					// Capture initial token usage from message_start event
 					// This ensures we have input token counts even if the stream is aborted early
 					output.usage.input = event.message.usage.input_tokens || 0;
@@ -630,9 +632,25 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					calculateCost(usageModel, output.usage);
 				} else if (event.type === "content_block_start") {
 					if (event.content_block.type === "fallback") {
-						if (output.content.length > 0) {
+						// Replay after output began needs the marker. Callers that rebuild messages from
+						// reduced events lose it, and Anthropic can then reject later requests (#9074).
+						if (output.content.length > 0 && !options?.retainsFinalMessage) {
 							throw new Error("Anthropic performed an unsupported mid-output model fallback");
 						}
+						// The fallback model does not continue a declined model's tool calls. Executing
+						// them would act on abandoned output, so fail the turn instead.
+						if (output.content.some((block) => block.type === "toolCall")) {
+							throw new Error("Anthropic performed an unsupported model fallback after a tool call");
+						}
+						// Record the marker without touching `content`, so streamed indices stay valid.
+						// Parsed from JSON, so the SDK's trigger interface is a JSON object at runtime.
+						const block = event.content_block as unknown as AnthropicFallbackBlock;
+						output.anthropicFallbacks = [
+							...(output.anthropicFallbacks ?? []),
+							{ position: output.content.length, block },
+						];
+						setServingModel(block.to.model);
+						calculateCost(usageModel, output.usage);
 						continue;
 					}
 					if (event.content_block.type === "text") {
@@ -1005,6 +1023,7 @@ function getBetaFeatures(
 	context: TranscriptContext,
 	isOAuthToken: boolean,
 	nativeToolChanges: boolean,
+	replaysFallbacks: boolean,
 	options?: AnthropicOptions,
 ): NonNullable<MessageCreateParamsStreaming["betas"]> {
 	let configuredFeatures: string | null | undefined;
@@ -1036,7 +1055,10 @@ function getBetaFeatures(
 	) {
 		features.push(INTERLEAVED_THINKING_BETA);
 	}
-	if (shouldUseServerSideFallbackBeta(model)) features.push(SERVER_SIDE_FALLBACK_BETA);
+	// Replayed fallback markers need the beta even when the current model has no fallbacks.
+	if ((model.compat?.allowedFallbackModels?.length ?? 0) > 0 || replaysFallbacks) {
+		features.push(SERVER_SIDE_FALLBACK_BETA);
+	}
 	if (model.compat?.supportsMidConvoEffort === true) {
 		features.push(MID_CONVERSATION_OUTPUT_CONFIG_BETA, THINKING_BINDING_CONTROLS_BETA);
 	}
@@ -1074,7 +1096,11 @@ function buildParams(
 		nativeToolChanges,
 	);
 	const activeEffort = options?.effort ?? "high";
-	const betaFeatures = getBetaFeatures(model, context, isOAuthToken, nativeToolChanges, options);
+	// transformMessages already dropped errored turns and markers from other providers or APIs.
+	const replaysFallbacks = conversationMessages.some(
+		(message) => message.role === "assistant" && (message.anthropicFallbacks?.length ?? 0) > 0,
+	);
+	const betaFeatures = getBetaFeatures(model, context, isOAuthToken, nativeToolChanges, replaysFallbacks, options);
 	const params: MessageCreateParamsStreaming = {
 		model: model.id,
 		messages:
@@ -1321,8 +1347,15 @@ function convertMessages(
 		} else if (msg.role === "assistant") {
 			flushPendingSystemMessages();
 			const blocks: ContentBlockParam[] = [];
+			// Anthropic validates thinking against fallback markers, so echo every marker in its
+			// original slot, even before blocks that are skipped below.
+			const fallbacks = msg.anthropicFallbacks ?? [];
+			let nextFallback = 0;
 
-			for (const block of msg.content) {
+			for (const [index, block] of msg.content.entries()) {
+				while (nextFallback < fallbacks.length && fallbacks[nextFallback].position <= index) {
+					blocks.push(fallbacks[nextFallback++].block);
+				}
 				if (block.type === "text") {
 					if (block.text.trim().length === 0) continue;
 					blocks.push({
@@ -1373,6 +1406,7 @@ function convertMessages(
 					});
 				}
 			}
+			blocks.push(...fallbacks.slice(nextFallback).map((fallback) => fallback.block));
 			if (blocks.length === 0) continue;
 			const messageIndex = params.length;
 			params.push({

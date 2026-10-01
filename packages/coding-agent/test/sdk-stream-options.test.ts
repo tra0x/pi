@@ -268,6 +268,15 @@ describe("createAgentSession stream options", () => {
 		expect(options?.maxRetryDelayMs).toBe(3000);
 	});
 
+	// Regression test for #9074: AgentSession persists and replays the complete message_end message.
+	it("declares that session requests retain the final message", async () => {
+		const options = await captureStreamOptions("anthropic-messages", {});
+		expect(options?.retainsFinalMessage).toBe(true);
+
+		const overridden = await captureStreamOptions("anthropic-messages", {}, { retainsFinalMessage: false });
+		expect(overridden?.retainsFinalMessage).toBe(true);
+	});
+
 	// Regression test for #9784.
 	it("forwards provider stream events to extensions", async () => {
 		const providerEvent = { openrouter_metadata: { strategy: "direct" } };
